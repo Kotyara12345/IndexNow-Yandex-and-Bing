@@ -3,27 +3,26 @@
 Не знает о Tkinter. Общается с UI через callback `post(kind, payload)`,
 который должен быть потокобезопасным.
 """
-from typing import Callable
+from collections.abc import Callable
+from typing import NamedTuple
 
 import requests
 
+from . import protocol
 from .client import IndexNowClient
+from .endpoints import Engine
+from .logging_setup import get_logger
 from .url_utils import URLUtils
 
-
-MAX_URLS_PER_REQUEST = 10_000
-
-STATUS_MESSAGES = {
-    200: "OK. Страницы переданы на переиндексацию.",
-    202: "Ключ принят и ожидает проверки. Отправьте ещё несколько адресов.",
-    403: "Неверный ключ. Проверьте ключ и его расположение.",
-    422: "Ошибка валидации. Проверьте ключ, URL и параметры.",
-    429: "Слишком много запросов. Подождите и повторите позже.",
-}
-
-DEFAULT_HOST_PLACEHOLDER = "example.com"
-
 PostFn = Callable[[str, object], None]
+
+
+class _Plan(NamedTuple):
+    """Разобранные и проверенные данные, готовые к отправке."""
+
+    host: str
+    groups: dict[str, list[str]]  # scheme -> URL
+    key_locations: dict[str, str]  # scheme -> keyLocation (может быть "")
 
 
 class IndexNowService:
@@ -32,6 +31,7 @@ class IndexNowService:
     def __init__(self, client: IndexNowClient, post: PostFn) -> None:
         self._client = client
         self._post = post
+        self._logger = get_logger()
 
     # ------------------------------------------------------------ public ----
 
@@ -41,14 +41,21 @@ class IndexNowService:
         key: str,
         key_location_raw: str,
         raw_urls: str,
+        engines: list[Engine],
         shutdown_event,
     ) -> None:
         """Гарантирует enable_send в finally, даже при исключении."""
         try:
             self._run_impl(
-                host_raw, key, key_location_raw, raw_urls, shutdown_event
+                host_raw,
+                key,
+                key_location_raw,
+                raw_urls,
+                engines,
+                shutdown_event,
             )
         except Exception as exc:  # noqa: BLE001
+            self._logger.exception("Непредвиденная ошибка отправки")
             self._post("error", f"Непредвиденная ошибка: {exc!r}")
         finally:
             self._post("enable_send", True)
@@ -61,18 +68,33 @@ class IndexNowService:
         key: str,
         key_location_raw: str,
         raw_urls: str,
+        engines: list[Engine],
         shutdown_event,
     ) -> None:
+        if not engines:
+            self._post("error", "Выберите хотя бы один приёмник.")
+            return
+
+        plan = self._build_plan(host_raw, key_location_raw, raw_urls)
+        if plan is None:
+            return
+
+        self._send_all(plan, key, engines, shutdown_event)
+
+    def _build_plan(
+        self, host_raw: str, key_location_raw: str, raw_urls: str
+    ) -> _Plan | None:
+        """Готовит план отправки. При ошибке пишет в UI и возвращает None."""
         raw_lines = [u.strip() for u in raw_urls.splitlines() if u.strip()]
         if not raw_lines:
             self._post("error", "Введите хотя бы одну ссылку.")
-            return
+            return None
 
         unique_urls, duplicates_count = URLUtils.encode_and_dedup(raw_lines)
 
         # --- Авто-подстановка домена ---
         host_was_auto = False
-        if not host_raw or host_raw.lower() == DEFAULT_HOST_PLACEHOLDER:
+        if not host_raw or host_raw.lower() == protocol.PLACEHOLDER_HOST:
             detected = URLUtils.detect_host_from_encoded(unique_urls)
             if detected:
                 host_raw = detected
@@ -81,7 +103,7 @@ class IndexNowService:
 
         if not host_raw:
             self._post("error", "Укажите домен (host).")
-            return
+            return None
 
         host, host_scheme = URLUtils.normalize_host(host_raw)
         if not host:
@@ -89,7 +111,7 @@ class IndexNowService:
                 "error",
                 "Не удалось распознать домен. Проверьте формат.",
             )
-            return
+            return None
 
         (
             valid_urls,
@@ -126,7 +148,7 @@ class IndexNowService:
                 f"Всего введено: {len(raw_lines)}, "
                 f"отклонено: {rejected_total}.",
             )
-            return
+            return None
 
         # --- Группировка по схеме ---
         groups: dict[str, list[str]] = {}
@@ -138,7 +160,7 @@ class IndexNowService:
 
         if not groups:
             self._post("error", "Не удалось разобрать валидные URL.")
-            return
+            return None
 
         multi_scheme = len(groups) > 1
         kl_user_explicit = "://" in key_location_raw
@@ -153,31 +175,31 @@ class IndexNowService:
             )
             self._post(
                 "log",
-                "\nОбнаружены URL с разными схемами. "
-                "Отправка будет выполнена двумя запросами - "
-                "сначала http://, затем https://. " + note,
+                "\nОбнаружены URL с разными схемами. Отправка будет "
+                "выполнена отдельными запросами для http:// и https://. "
+                + note,
             )
 
-        # Общее число пакетов по всем группам - для Progressbar.
-        total_batches = sum(
-            (len(g) + MAX_URLS_PER_REQUEST - 1) // MAX_URLS_PER_REQUEST
-            for g in groups.values()
+        key_locations = self._prepare_key_locations(
+            groups, host, key_location_raw, kl_user_explicit, multi_scheme
         )
-        done_batches = 0
+        if key_locations is None:
+            return None
 
-        for scheme in sorted(groups.keys()):
-            if shutdown_event.is_set():
-                return
+        return _Plan(host, groups, key_locations)
 
-            group_urls = groups[scheme]
+    def _prepare_key_locations(
+        self,
+        groups: dict[str, list[str]],
+        host: str,
+        key_location_raw: str,
+        kl_user_explicit: bool,
+        multi_scheme: bool,
+    ) -> dict[str, str] | None:
+        """Считает и проверяет keyLocation для каждой схемы."""
+        key_locations: dict[str, str] = {}
 
-            if multi_scheme:
-                self._post(
-                    "log",
-                    f"\n--- Группа {scheme}:// ({len(group_urls)} URL) ---",
-                )
-
-            # --- Формирование keyLocation для этой группы ---
+        for scheme in sorted(groups):
             if kl_user_explicit:
                 kl = URLUtils.encode_url(key_location_raw)
                 enforce_scheme = False
@@ -189,78 +211,165 @@ class IndexNowService:
                 kl = URLUtils.encode_url(kl)
                 enforce_scheme = True
 
+            error = URLUtils.validate_key_location(
+                kl, host, {scheme}, enforce_scheme=enforce_scheme
+            )
+            if error:
+                self._post(
+                    "error",
+                    f"Ошибка валидации keyLocation ({scheme}://):\n{error}",
+                )
+                return None
+
             # Автозаполнение UI-поля только для одиночной схемы
             # и только если пользователь сам не вводил полный URL.
             if not multi_scheme and not kl_user_explicit and kl:
                 self._post("set_key_location", kl)
                 self._post("log", f"keyLocation дополнен: {kl}")
 
-            err = URLUtils.validate_key_location(
-                kl, host, {scheme}, enforce_scheme=enforce_scheme
-            )
-            if err:
-                self._post(
-                    "error",
-                    f"Ошибка валидации keyLocation ({scheme}://):\n{err}",
-                )
+            self._warn_key_location_scope(kl, groups[scheme])
+            key_locations[scheme] = kl
+
+        return key_locations
+
+    def _warn_key_location_scope(
+        self, key_location: str, urls: list[str]
+    ) -> None:
+        """Предупреждает, если keyLocation не покрывает часть URL."""
+        if not key_location:
+            return
+        outside = URLUtils.urls_outside_key_location(key_location, urls)
+        if not outside:
+            return
+        scope = URLUtils.key_location_scope(key_location)
+        self._post(
+            "log",
+            f"Внимание: keyLocation «{key_location}» покрывает только "
+            f"URL по пути «{scope}». Вне него {len(outside)} URL - "
+            f"движок может отклонить их (HTTP 422).",
+        )
+
+    def _send_all(
+        self,
+        plan: _Plan,
+        key: str,
+        engines: list[Engine],
+        shutdown_event,
+    ) -> None:
+        per_engine_batches = sum(
+            (len(group) + protocol.MAX_URLS_PER_REQUEST - 1)
+            // protocol.MAX_URLS_PER_REQUEST
+            for group in plan.groups.values()
+        )
+        total_batches = per_engine_batches * len(engines)
+        done_batches = 0
+        summary: dict[str, list[int | None]] = {}
+
+        for engine in engines:
+            if shutdown_event.is_set():
                 return
 
-            batches = [
-                group_urls[i : i + MAX_URLS_PER_REQUEST]
-                for i in range(0, len(group_urls), MAX_URLS_PER_REQUEST)
-            ]
-
             self._post(
-                "log",
-                f"Отправка {len(group_urls)} URL на {host} "
-                f"({len(batches)} пакет(ов))...",
+                "log", f"\n=== Приёмник: {engine.title} ({engine.url}) ==="
             )
+            statuses: list[int | None] = []
+            summary[engine.key] = statuses
 
-            for idx, batch in enumerate(batches, 1):
-                if shutdown_event.is_set():
-                    return
+            for scheme in sorted(plan.groups):
+                group_urls = plan.groups[scheme]
 
-                if len(batches) > 1:
+                if len(plan.groups) > 1:
                     self._post(
                         "log",
-                        f"Пакет {idx}/{len(batches)}: {len(batch)} URL",
+                        f"--- {scheme}:// ({len(group_urls)} URL) ---",
                     )
 
-                self._send_one_batch(host, key, kl, batch, idx)
-                done_batches += 1
-                self._post("progress", (done_batches, total_batches))
+                batches = [
+                    group_urls[i : i + protocol.MAX_URLS_PER_REQUEST]
+                    for i in range(
+                        0, len(group_urls), protocol.MAX_URLS_PER_REQUEST
+                    )
+                ]
+                self._post(
+                    "log",
+                    f"Отправка {len(group_urls)} URL на {plan.host} "
+                    f"({len(batches)} пакет(ов))...",
+                )
+
+                for idx, batch in enumerate(batches, 1):
+                    if shutdown_event.is_set():
+                        return
+                    if len(batches) > 1:
+                        self._post(
+                            "log",
+                            f"Пакет {idx}/{len(batches)}: {len(batch)} URL",
+                        )
+
+                    status = self._send_one_batch(
+                        engine, plan, key, scheme, batch, idx
+                    )
+                    statuses.append(status)
+                    done_batches += 1
+                    self._post("progress", (done_batches, total_batches))
+
+        self._log_summary(engines, summary)
 
     def _send_one_batch(
         self,
-        host: str,
+        engine: Engine,
+        plan: _Plan,
         key: str,
-        key_location: str,
+        scheme: str,
         batch: list[str],
         idx: int,
-    ) -> None:
-        """Отправляет один пакет, обрабатывает сетевые ошибки внутри себя."""
+    ) -> int | None:
+        """Отправляет один пакет. Возвращает HTTP-код или None при сбое."""
         try:
             response = self._client.send_batch(
-                host=host,
+                endpoint=engine.url,
+                host=plan.host,
                 key=key,
                 url_list=batch,
-                key_location=key_location or None,
+                key_location=plan.key_locations.get(scheme) or None,
             )
         except requests.exceptions.Timeout:
             self._post("log", f"Пакет {idx}: таймаут запроса.")
-            return
+            return None
         except requests.exceptions.ConnectionError:
             self._post("log", f"Пакет {idx}: ошибка соединения.")
-            return
+            return None
         except requests.exceptions.RequestException as exc:
             self._post("log", f"Пакет {idx}: ошибка HTTP-запроса: {exc}")
-            return
+            return None
 
         status = response.status_code
-        message = STATUS_MESSAGES.get(
-            status, f"Ответ сервера: {response.text[:500]}"
+        self._post(
+            "log",
+            f"HTTP-код ответа: {status}. "
+            f"{protocol.status_message(status, response.text)}",
         )
-        self._post("log", f"HTTP-код ответа: {status}. {message}")
+        return status
+
+    def _log_summary(
+        self, engines: list[Engine], summary: dict[str, list[int | None]]
+    ) -> None:
+        lines = ["", "=" * 60, "Итог отправки:"]
+        for engine in engines:
+            statuses = summary.get(engine.key, [])
+            if not statuses:
+                lines.append(f"   {engine.title}: запросы не выполнялись")
+                continue
+            counts: dict[str, int] = {}
+            for status in statuses:
+                label = str(status) if status is not None else "сбой сети"
+                counts[label] = counts.get(label, 0) + 1
+            parts = ", ".join(
+                f"{label} - {count}" for label, count in counts.items()
+            )
+            lines.append(
+                f"   {engine.title}: запросов {len(statuses)} ({parts})"
+            )
+        self._post("log", "\n".join(lines))
 
     def _log_stats(
         self,
@@ -309,6 +418,6 @@ class IndexNowService:
         ):
             if items:
                 lines.append("   " + label)
-                for u in items[:5]:
-                    lines.append(f"      {u}")
+                for url in items[:5]:
+                    lines.append(f"      {url}")
         self._post("log", "\n".join(lines))

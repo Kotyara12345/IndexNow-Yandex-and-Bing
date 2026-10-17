@@ -1,0 +1,6 @@
+# Зависимости для разработки и проверок (pytest, ruff, mypy).
+-r requirements.txt
+
+pytest>=8.0
+ruff>=0.6
+mypy>=1.11

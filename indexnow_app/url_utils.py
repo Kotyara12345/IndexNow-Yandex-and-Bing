@@ -2,7 +2,6 @@
 
 Не зависят от Tkinter и requests - легко тестируются в pytest.
 """
-from typing import Optional
 from urllib.parse import (
     ParseResult,
     quote,
@@ -11,7 +10,6 @@ from urllib.parse import (
     urlparse,
     urlunparse,
 )
-
 
 PATH_SAFE = "/:@!$&'()*+,;=~"
 PARAMS_SAFE = "/:@!$&'()*+,;=~"
@@ -32,10 +30,10 @@ class URLUtils:
       * нестандартный порт делает URL непригодным для IndexNow.
     """
 
-    # -------------------------------------------------------- базовые утилиты --
+    # ---------------------------------------- базовые утилиты --
 
     @staticmethod
-    def safe_parse(url: str) -> Optional[ParseResult]:
+    def safe_parse(url: str) -> ParseResult | None:
         """urlparse с защитой от ValueError / UnicodeError.
 
         На некорректных URL (битый IPv6, порт вне диапазона) возвращает None.
@@ -67,7 +65,7 @@ class URLUtils:
         """Сравнение хостов без порта, без скобок IPv6, в нижнем регистре."""
         return URLUtils.to_ascii_host(a) == URLUtils.to_ascii_host(b)
 
-    # ------------------------------------------------------------ кодирование --
+    # -------------------------------------------- кодирование --
 
     @staticmethod
     def encode_url(url: str) -> str:
@@ -144,7 +142,10 @@ class URLUtils:
 
     @staticmethod
     def canonical_key(url: str) -> str:
-        """Ключ дедупликации: схема и netloc в нижнем регистре, пустой путь -> '/'."""
+        """Ключ дедупликации: схема и netloc в нижнем регистре.
+
+        Пустой путь считается корнем '/'.
+        """
         parsed = URLUtils.safe_parse(url)
         if parsed is None:
             return url.lower()
@@ -183,10 +184,10 @@ class URLUtils:
                 return URLUtils.to_ascii_host(parsed.hostname)
         return ""
 
-    # ---------------------------------------------------------------- host ----
+    # ------------------------------------------------- host ----
 
     @staticmethod
-    def normalize_host(host: str) -> tuple[str, Optional[str]]:
+    def normalize_host(host: str) -> tuple[str, str | None]:
         """(hostname_punycode, scheme_or_None).
 
         Порт и скобки IPv6 отбрасываются.
@@ -210,7 +211,7 @@ class URLUtils:
 
     @staticmethod
     def autocomplete_key_location(
-        key_location: str, host: str, scheme: Optional[str]
+        key_location: str, host: str, scheme: str | None
     ) -> str:
         """Дополняет keyLocation схемой и/или хостом.
 
@@ -239,7 +240,43 @@ class URLUtils:
 
         return f"{effective_scheme}://{kl}"
 
-    # ------------------------------------------------------------ validation --
+    # --------------------------------------- область действия keyLocation --
+
+    @staticmethod
+    def key_location_scope(key_location: str) -> str:
+        """Каталог, который покрывает keyLocation.
+
+        По спецификации IndexNow (вариант 2) keyLocation из подпапки
+        покрывает только URL с этим префиксом пути. Пустая строка
+        означает «покрывает весь домен».
+        """
+        parsed = URLUtils.safe_parse(key_location)
+        if parsed is None or parsed.scheme not in ("http", "https"):
+            return ""
+        path = parsed.path or "/"
+        if not path.endswith("/"):
+            path = path.rsplit("/", 1)[0] + "/"
+        return path
+
+    @staticmethod
+    def urls_outside_key_location(
+        key_location: str, urls: list[str]
+    ) -> list[str]:
+        """URL, не попадающие в область действия keyLocation."""
+        scope = URLUtils.key_location_scope(key_location)
+        if not scope or scope == "/":
+            return []
+        outside: list[str] = []
+        for url in urls:
+            parsed = URLUtils.safe_parse(url)
+            if parsed is None:
+                outside.append(url)
+                continue
+            if not (parsed.path or "/").startswith(scope):
+                outside.append(url)
+        return outside
+
+    # -------------------------------------------- validation --
 
     @staticmethod
     def validate_key_location(
@@ -247,10 +284,11 @@ class URLUtils:
         host: str,
         valid_schemes: set[str],
         enforce_scheme: bool = True,
-    ) -> Optional[str]:
+    ) -> str | None:
         """Проверяет keyLocation. Возвращает текст ошибки или None.
 
-        enforce_scheme=True  - проверяем совпадение схемы (автодополненный URL);
+        enforce_scheme=True  - проверяем совпадение схемы
+                               (автодополненный URL);
         enforce_scheme=False - схему не проверяем (пользователь ввёл явный URL,
                                сам отвечает за совместимость с IndexNow).
         """
@@ -289,7 +327,7 @@ class URLUtils:
     def split_urls(
         urls: list[str],
         host: str,
-        expected_scheme: Optional[str],
+        expected_scheme: str | None,
     ) -> tuple[list[str], list[str], list[str], list[str], set[str]]:
         """Разделяет URL на группы.
 

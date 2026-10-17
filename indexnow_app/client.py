@@ -1,26 +1,25 @@
 """HTTP-клиент IndexNow с автоматическими retry на 429 / 5xx."""
-import sys
-
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 
+from .logging_setup import get_logger
 
-INDEXNOW_ENDPOINT = "https://yandex.com/indexnow"
-REQUEST_TIMEOUT_SECONDS = 30
+# Таймаут (подключение, чтение ответа) в секундах.
+CONNECT_TIMEOUT_SECONDS = 10
+READ_TIMEOUT_SECONDS = 30
 
 
 class IndexNowClient:
     """HTTP-клиент IndexNow. Один Session на всё приложение."""
 
     def __init__(self) -> None:
+        self._logger = get_logger()
         self._session = requests.Session()
-        self._session.headers.update(
-            {"User-Agent": "IndexNow-Yandex-GUI/1.0"}
-        )
+        self._session.headers.update({"User-Agent": "IndexNow-GUI/1.0"})
 
         # Автоматический повтор при 429 / 5xx с экспоненциальной задержкой.
-        # Уважает заголовок Retry-After, если его присылает Яндекс.
+        # Уважает заголовок Retry-After, если его присылает движок.
         retries = Retry(
             total=3,
             connect=3,
@@ -39,6 +38,7 @@ class IndexNowClient:
 
     def send_batch(
         self,
+        endpoint: str,
         host: str,
         key: str,
         url_list: list[str],
@@ -49,10 +49,17 @@ class IndexNowClient:
         if key_location:
             payload["keyLocation"] = key_location
 
+        self._logger.debug(
+            "POST %s: host=%s, urlList=%d, keyLocation=%s",
+            endpoint,
+            host,
+            len(url_list),
+            key_location or "-",
+        )
         return self._session.post(
-            INDEXNOW_ENDPOINT,
+            endpoint,
             json=payload,
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            timeout=(CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS),
         )
 
     def close(self) -> None:
@@ -62,4 +69,4 @@ class IndexNowClient:
         try:
             self._session.close()
         except Exception as exc:  # noqa: BLE001
-            print(f"[http-session] close error: {exc!r}", file=sys.stderr)
+            self._logger.warning("Ошибка закрытия HTTP-сессии: %r", exc)
